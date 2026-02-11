@@ -6,6 +6,7 @@ Offline ERG-only trainer app focused on reliable KICKR CORE BLE FTMS control.
 
 - Single rider profile.
 - One trainer connection (KICKR CORE) over BLE FTMS.
+- Optional Bluetooth heart-rate monitor connection (standard Heart Rate service).
 - Structured workout execution in ERG mode only.
 - Workout import: JSON and optional ZWO.
 - Controls: Start, Pause, Resume, Skip, Back, End.
@@ -18,7 +19,6 @@ Out of scope in v1:
 - SIM/resistance modes.
 - Route/world gameplay.
 - Multiplayer/ghosts.
-- Heart-rate strap support.
 
 ## Run from source
 
