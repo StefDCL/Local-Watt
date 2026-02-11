@@ -40,8 +40,11 @@ FTMS_SERVICE_UUID = "00001826-0000-1000-8000-00805f9b34fb"
 FTMS_CONTROL_POINT_UUID = "00002ad9-0000-1000-8000-00805f9b34fb"
 FTMS_INDOOR_BIKE_DATA_UUID = "00002ad2-0000-1000-8000-00805f9b34fb"
 FTMS_STATUS_UUID = "00002ada-0000-1000-8000-00805f9b34fb"
+HEART_RATE_SERVICE_UUID = "0000180d-0000-1000-8000-00805f9b34fb"
+HEART_RATE_MEASUREMENT_UUID = "00002a37-0000-1000-8000-00805f9b34fb"
 
 KICKR_FILTER = "kickr core"
+HR_NAME_HINTS = ("hr", "heart", "tickr", "h10", "verity", "monitor")
 MIN_TARGET_WATTS = 80
 SAFE_PAUSE_WATTS = 100
 
@@ -401,6 +404,11 @@ class FTMSBridge:
             "power_w": None,
             "cadence_rpm": None,
             "speed_kph": None,
+            "heart_rate_bpm": None,
+            "hr_connected": False,
+            "hr_name": "-",
+            "hr_address": None,
+            "hr_status": "Disconnected",
             "control_status": "-",
             "machine_status": "-",
         }
@@ -415,6 +423,8 @@ class FTMSBridge:
         self._ibd_uuid: str | None = None
         self._status_uuid: str | None = None
         self._cp_lock: asyncio.Lock | None = None
+        self._hr_client: BleakClient | None = None
+        self._hr_uuid: str | None = None
 
     def _run_loop(self) -> None:
         asyncio.set_event_loop(self._loop)
@@ -442,11 +452,20 @@ class FTMSBridge:
     def scan_kickr(self, timeout: float = SCAN_TIMEOUT_SECONDS):
         return self._submit(self._scan_kickr(timeout))
 
+    def scan_hr_monitors(self, timeout: float = SCAN_TIMEOUT_SECONDS):
+        return self._submit(self._scan_hr_monitors(timeout))
+
     def connect(self, address: str):
         return self._submit(self._connect(address))
 
     def disconnect(self):
         return self._submit(self._disconnect())
+
+    def connect_hr(self, address: str):
+        return self._submit(self._connect_hr(address))
+
+    def disconnect_hr(self):
+        return self._submit(self._disconnect_hr())
 
     def request_control(self):
         return self._submit(self._request_control())
@@ -468,6 +487,10 @@ class FTMSBridge:
             self.disconnect().result(timeout=8.0)
         except Exception:
             pass
+        try:
+            self.disconnect_hr().result(timeout=8.0)
+        except Exception:
+            pass
         if self._loop.is_running():
             self._loop.call_soon_threadsafe(self._loop.stop)
         if self._thread.is_alive():
@@ -487,6 +510,25 @@ class FTMSBridge:
             devices.append(DeviceChoice(name=name, address=addr, rssi=rssi))
         devices.sort(key=lambda d: (-d.rssi, d.name))
         self._set_state(status=f"Scan complete: {len(devices)} KICKR CORE found")
+        return devices
+
+    async def _scan_hr_monitors(self, timeout: float) -> list[DeviceChoice]:
+        self._set_state(hr_status=f"Scanning BLE for HR monitor ({int(timeout)}s)...")
+        found = await BleakScanner.discover(timeout=timeout, return_adv=True)
+        entries = found.values() if isinstance(found, dict) else [(d, None) for d in found]
+        devices: list[DeviceChoice] = []
+        for device, adv in entries:
+            name = (getattr(adv, "local_name", "") or getattr(device, "name", "") or "Unknown HR Device").strip()
+            uuids = [u.lower() for u in (getattr(adv, "service_uuids", None) or [])]
+            has_hr_service = HEART_RATE_SERVICE_UUID.lower() in uuids
+            looks_like_hr = any(hint in name.lower() for hint in HR_NAME_HINTS)
+            if not (has_hr_service or looks_like_hr):
+                continue
+            addr = getattr(device, "address", "")
+            rssi = int(getattr(adv, "rssi", -999) or -999)
+            devices.append(DeviceChoice(name=name, address=addr, rssi=rssi))
+        devices.sort(key=lambda d: (-d.rssi, d.name))
+        self._set_state(hr_status=f"Scan complete: {len(devices)} HR monitor(s) found")
         return devices
 
     async def _connect(self, address: str) -> None:
@@ -568,6 +610,62 @@ class FTMSBridge:
             machine_status="-",
         )
 
+    async def _connect_hr(self, address: str) -> None:
+        await self._disconnect_hr()
+        self._set_state(hr_status="Connecting HR monitor...", last_error=None)
+        try:
+            device = await BleakScanner.find_device_by_address(address, timeout=12.0)
+            if device is None:
+                raise RuntimeError("HR monitor not found.")
+
+            client = BleakClient(device, disconnected_callback=self._on_hr_disconnected)
+            await client.connect()
+            await client.get_services()
+            measurement = client.services.get_characteristic(HEART_RATE_MEASUREMENT_UUID)
+            if measurement is None:
+                raise RuntimeError("Heart Rate Measurement characteristic missing.")
+            if "notify" not in measurement.properties:
+                raise RuntimeError("HR monitor does not support notifications.")
+
+            await client.start_notify(measurement.uuid, self._on_hr_notify)
+            self._hr_client = client
+            self._hr_uuid = measurement.uuid
+            name = getattr(device, "name", None) or address
+            self._set_state(
+                hr_connected=True,
+                hr_name=name,
+                hr_address=address,
+                hr_status=f"Connected: {name}",
+                heart_rate_bpm=None,
+            )
+        except Exception as exc:
+            await self._disconnect_hr()
+            self._set_state(last_error=str(exc), hr_status=f"Connect failed: {exc}")
+            raise
+
+    async def _disconnect_hr(self) -> None:
+        client = self._hr_client
+        hr_uuid = self._hr_uuid
+        self._hr_client = None
+        self._hr_uuid = None
+        if client is not None:
+            if hr_uuid:
+                try:
+                    await client.stop_notify(hr_uuid)
+                except Exception:
+                    pass
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+        self._set_state(
+            hr_connected=False,
+            hr_name="-",
+            hr_address=None,
+            hr_status="Disconnected",
+            heart_rate_bpm=None,
+        )
+
     async def _request_control(self) -> None:
         await self._write_cp(bytes([0x00]))
 
@@ -614,6 +712,21 @@ class FTMSBridge:
     def _on_status_notify(self, _sender: Any, data: bytearray) -> None:
         if data:
             self._set_state(machine_status=f"0x{data[0]:02X}")
+
+    def _on_hr_disconnected(self, _client: BleakClient) -> None:
+        self._set_state(
+            hr_connected=False,
+            hr_status="HR monitor disconnected",
+            heart_rate_bpm=None,
+        )
+
+    def _on_hr_notify(self, _sender: Any, data: bytearray) -> None:
+        if len(data) < 2:
+            return
+        flags = data[0]
+        is_uint16 = bool(flags & 0x01)
+        bpm = int.from_bytes(data[1:3], byteorder="little", signed=False) if is_uint16 and len(data) >= 3 else int(data[1])
+        self._set_state(heart_rate_bpm=bpm)
 
     def _on_indoor_bike_data(self, _sender: Any, data: bytearray) -> None:
         if len(data) < 4:
@@ -678,6 +791,10 @@ class LocalWattApp(tk.Tk):
         self.selected_device_index: int | None = None
         self.connected_address: str | None = None
 
+        self.hr_device_choices: list[DeviceChoice] = []
+        self.selected_hr_device_index: int | None = None
+        self.hr_connected_address: str | None = None
+
         self.state = EngineState.IDLE
         self.state_message = "Connect KICKR CORE and load a workout."
         self.last_connected_flag = False
@@ -685,6 +802,9 @@ class LocalWattApp(tk.Tk):
         self.pending_scan = None
         self.pending_connect = None
         self.pending_disconnect = None
+        self.pending_hr_scan = None
+        self.pending_hr_connect = None
+        self.pending_hr_disconnect = None
 
         self.reconnect_until = 0.0
         self.next_reconnect_attempt = 0.0
@@ -801,6 +921,29 @@ class LocalWattApp(tk.Tk):
         self.device_status = tk.Label(device_box, text="Disconnected", bg="#132033", fg="#c8d7ee", anchor="w", justify="left")
         self.device_status.pack(fill="x", pady=(6, 0))
 
+        hr_box = ttk.LabelFrame(left, text="HR Monitor", padding=8)
+        hr_box.pack(fill="x", pady=(0, 8))
+        ttk.Button(hr_box, text="Scan HR", command=self._scan_hr_devices).pack(fill="x", pady=(0, 4))
+        self.hr_device_list = tk.Listbox(
+            hr_box,
+            height=4,
+            bg="#0f1725",
+            fg="#e7f0ff",
+            selectbackground="#3b82f6",
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=0,
+            font=("Segoe UI", 10),
+        )
+        self.hr_device_list.pack(fill="x", pady=(0, 4))
+        self.hr_device_list.bind("<<ListboxSelect>>", self._on_hr_device_selected)
+        hr_btn_row = ttk.Frame(hr_box)
+        hr_btn_row.pack(fill="x")
+        ttk.Button(hr_btn_row, text="Connect HR", command=self._connect_hr_selected).pack(side="left", fill="x", expand=True, padx=(0, 4))
+        ttk.Button(hr_btn_row, text="Disconnect HR", command=self._disconnect_hr_monitor).pack(side="left", fill="x", expand=True)
+        self.hr_status = tk.Label(hr_box, text="Disconnected", bg="#132033", fg="#c8d7ee", anchor="w", justify="left")
+        self.hr_status.pack(fill="x", pady=(6, 0))
+
         workout_box = ttk.LabelFrame(left, text="Workout", padding=8)
         workout_box.pack(fill="x", pady=(0, 8))
         self.workout_combo = ttk.Combobox(workout_box, state="readonly")
@@ -875,6 +1018,7 @@ class LocalWattApp(tk.Tk):
             "step": tk.StringVar(value="-"),
             "step_countdown": tk.StringVar(value="00:00"),
             "cadence": tk.StringVar(value="--"),
+            "heart_rate": tk.StringVar(value="--"),
             "speed": tk.StringVar(value="--"),
             "connection": tk.StringVar(value="Disconnected"),
         }
@@ -886,6 +1030,7 @@ class LocalWattApp(tk.Tk):
             ("Step", "step"),
             ("Step Left", "step_countdown"),
             ("Cadence", "cadence"),
+            ("Heart Rate", "heart_rate"),
             ("Speed", "speed"),
             ("Connection", "connection"),
         ]
@@ -1078,6 +1223,37 @@ class LocalWattApp(tk.Tk):
         self.next_reconnect_attempt = 0.0
         self.auto_paused_for_disconnect = False
         self._set_state(EngineState.IDLE, "Disconnected.")
+
+    def _scan_hr_devices(self) -> None:
+        if self.pending_hr_scan and not self.pending_hr_scan.done():
+            return
+        self.state_message = "Scanning BLE for HR monitor..."
+        self.pending_hr_scan = self.bridge.scan_hr_monitors(SCAN_TIMEOUT_SECONDS)
+
+    def _on_hr_device_selected(self, _event: Any = None) -> None:
+        sel = self.hr_device_list.curselection()
+        if not sel:
+            return
+        self.selected_hr_device_index = int(sel[0])
+
+    def _connect_hr_selected(self) -> None:
+        if self.pending_hr_connect and not self.pending_hr_connect.done():
+            return
+        if self.selected_hr_device_index is None:
+            messagebox.showinfo("HR Monitor", "Select an HR monitor from the list first.")
+            return
+        if self.selected_hr_device_index >= len(self.hr_device_choices):
+            return
+        choice = self.hr_device_choices[self.selected_hr_device_index]
+        self.hr_connected_address = choice.address
+        self.state_message = f"Connecting HR monitor {choice.name}..."
+        self.pending_hr_connect = self.bridge.connect_hr(choice.address)
+
+    def _disconnect_hr_monitor(self) -> None:
+        if self.pending_hr_disconnect and not self.pending_hr_disconnect.done():
+            return
+        self.pending_hr_disconnect = self.bridge.disconnect_hr()
+        self.hr_connected_address = None
 
     def _import_json(self) -> None:
         path = filedialog.askopenfilename(filetypes=[("Workout JSON", "*.json"), ("All files", "*.*")])
@@ -1272,10 +1448,12 @@ class LocalWattApp(tk.Tk):
             raw_power = float(telemetry.get("power_w") or 0.0)
             cadence = telemetry.get("cadence_rpm")
             speed = telemetry.get("speed_kph")
+            heart_rate = telemetry.get("heart_rate_bpm")
             row = {
                 "t_ms": t_ms,
                 "power": raw_power,
                 "cadence": float(cadence) if cadence is not None else None,
+                "heart_rate": int(heart_rate) if heart_rate is not None else None,
                 "speed": float(speed) if speed is not None else None,
                 "target_power": int(target),
                 "step_index": int(self.step_index),
@@ -1385,13 +1563,14 @@ class LocalWattApp(tk.Tk):
                 for key, value in self.latest_summary.items():
                     writer.writerow([key, value])
             writer.writerow([])
-            writer.writerow(["t_ms", "power", "cadence", "speed", "target_power", "step_index"])
+            writer.writerow(["t_ms", "power", "cadence", "heart_rate", "speed", "target_power", "step_index"])
             for row in self.samples:
                 writer.writerow(
                     [
                         int(row["t_ms"]),
                         float(row["power"]),
                         row["cadence"] if row["cadence"] is not None else "",
+                        row["heart_rate"] if row.get("heart_rate") is not None else "",
                         row["speed"] if row["speed"] is not None else "",
                         int(row["target_power"]),
                         int(row["step_index"]),
@@ -1448,6 +1627,8 @@ class LocalWattApp(tk.Tk):
                 if sample.get("speed") is not None:
                     ms = float(sample["speed"]) * (1000.0 / 3600.0)
                     record.speed = int(round(ms * 1000.0))
+                if sample.get("heart_rate") is not None:
+                    record.heart_rate = int(sample["heart_rate"])
                 builder.add(record)
 
             stop_event = EventMessage()
@@ -1524,6 +1705,39 @@ class LocalWattApp(tk.Tk):
                 self.state_message = f"Disconnect failed: {exc}"
             self.pending_disconnect = None
             self.user_disconnect_requested = False
+
+        if self.pending_hr_scan is not None and self.pending_hr_scan.done():
+            try:
+                self.hr_device_choices = self.pending_hr_scan.result()
+                self.hr_device_list.delete(0, tk.END)
+                for index, choice in enumerate(self.hr_device_choices):
+                    self.hr_device_list.insert(tk.END, f"{choice.name} ({choice.rssi:+d} dBm)")
+                    if index == 0:
+                        self.selected_hr_device_index = 0
+                if self.hr_device_choices:
+                    self.hr_device_list.selection_set(0)
+                else:
+                    self.selected_hr_device_index = None
+                self.state_message = f"Scan complete: {len(self.hr_device_choices)} HR monitor(s)."
+            except Exception as exc:
+                self.state_message = f"HR scan failed: {exc}"
+            self.pending_hr_scan = None
+
+        if self.pending_hr_connect is not None and self.pending_hr_connect.done():
+            try:
+                self.pending_hr_connect.result()
+                self.state_message = "HR monitor connected."
+            except Exception as exc:
+                self.state_message = f"HR connect failed: {exc}"
+            self.pending_hr_connect = None
+
+        if self.pending_hr_disconnect is not None and self.pending_hr_disconnect.done():
+            try:
+                self.pending_hr_disconnect.result()
+                self.state_message = "HR monitor disconnected."
+            except Exception as exc:
+                self.state_message = f"HR disconnect failed: {exc}"
+            self.pending_hr_disconnect = None
 
     def _handle_connection_events(self, now_ts: float, telemetry: dict[str, Any]) -> None:
         connected = bool(telemetry.get("connected"))
@@ -1662,6 +1876,7 @@ class LocalWattApp(tk.Tk):
         self.device_status.configure(
             text=f"{telemetry.get('status','-')}\nControl: {telemetry.get('control_status','-')}\nFTMS Status: {telemetry.get('machine_status','-')}"
         )
+        self.hr_status.configure(text=str(telemetry.get("hr_status") or "Disconnected"))
 
         workout = self._current_workout()
         step = self._current_step()
@@ -1689,8 +1904,10 @@ class LocalWattApp(tk.Tk):
         self.workout_progress["value"] = (self.workout_elapsed_s / max(total, 1.0)) * 100.0 if total else 0.0
 
         cadence = telemetry.get("cadence_rpm")
+        hr = telemetry.get("heart_rate_bpm")
         speed = telemetry.get("speed_kph")
         self.metric_vars["cadence"].set(f"{float(cadence):.0f} rpm" if cadence is not None else "--")
+        self.metric_vars["heart_rate"].set(f"{int(hr)} bpm" if hr is not None else "--")
         self.metric_vars["speed"].set(f"{float(speed):.1f} km/h" if speed is not None else "--")
 
         self._set_stage()
